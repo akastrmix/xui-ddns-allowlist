@@ -1,0 +1,13 @@
+# Local editor and OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.bak
+*.bak-*
+*.log
+
+# Local test artifacts
+state.json
