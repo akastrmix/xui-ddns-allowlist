@@ -512,11 +512,69 @@ maybe_ensure_ufw_allow() {
 
 warn_ufw_status() {
   if ! have_cmd ufw; then
+    echo "not installed"
     return 0
   fi
   if ufw status 2>/dev/null | grep -q "Status: active"; then
-    echo "INFO: UFW is active. Keep UFW allowing the configured panel port(s), because nftables only pre-filters sources."
+    echo "active"
+  else
+    echo "inactive"
   fi
+}
+
+print_install_summary() {
+  local table="${TABLE:-$DEFAULT_TABLE}"
+  local set4="${SET4:-$DEFAULT_SET4}"
+  local ports="${PORTS:-$DEFAULT_PORTS}"
+  local domains="${DDNS_DOMAINS:-${DDNS_DOMAIN:-$DEFAULT_DDNS_DOMAINS}}"
+  local timer_unit
+  timer_unit="$(basename "$TIMER")"
+  if [ -f "$CONFIG" ]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG" || true
+    table="${TABLE:-$table}"
+    set4="${SET4:-$set4}"
+    ports="${PORTS:-$ports}"
+    domains="${DDNS_DOMAINS:-${DDNS_DOMAIN:-$domains}}"
+  fi
+
+  echo
+  echo "xui-ddns-allowlist installed"
+  echo "==========================="
+  printf "Protected ports:  %s\n" "$(normalize_list "$ports")"
+  printf "DDNS domains:     %s\n" "$(normalize_list "$domains")"
+  printf "Timer:            %s, %s\n" "$(systemctl is-active "$timer_unit" 2>/dev/null || true)" "$(systemctl is-enabled "$timer_unit" 2>/dev/null || true)"
+  printf "UFW:              %s\n" "$(warn_ufw_status)"
+  printf "Config:           %s\n" "$CONFIG"
+  echo
+  echo "Allowed source IPs"
+  echo "------------------"
+  python3 - "$table" "$set4" <<'PYEOF'
+import re
+import subprocess
+import sys
+
+table, set4 = sys.argv[1:3]
+proc = subprocess.run(
+    ["nft", "list", "set", "inet", table, set4],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+if proc.returncode != 0:
+    print("  set missing or unreadable")
+else:
+    text = " ".join(proc.stdout.split())
+    rows = re.findall(r"((?:\d{1,3}\.){3}\d{1,3})\s+timeout\s+\S+\s+expires\s+([^,}]+)", text)
+    if not rows:
+        print("  none")
+    else:
+        for ip, expires in rows:
+            print(f"  {ip:<15} expires in {expires.strip()}")
+PYEOF
+  echo
+  echo "Check later:"
+  echo "  sudo bash install-xui-ddns-allowlist.sh --status"
 }
 
 install_all() {
@@ -531,14 +589,7 @@ install_all() {
   "$UPDATER" --force-table --init-only
   "$UPDATER"
   systemctl enable --now "$(basename "$INIT_SERVICE")" "$(basename "$TIMER")"
-  warn_ufw_status
-  echo
-  echo "Installed $SCRIPT_NAME."
-  echo "Config: $CONFIG"
-  echo "Status commands:"
-  echo "  nft list table inet ${TABLE:-$DEFAULT_TABLE}"
-  echo "  systemctl list-timers $(basename "$TIMER")"
-  echo "  journalctl -u $(basename "$SERVICE") -n 50 --no-pager"
+  print_install_summary
 }
 
 uninstall_all() {
@@ -672,12 +723,14 @@ show_set("IPv6", set6)
 PYEOF
 
   echo
-  echo "UFW"
-  echo "---"
+  echo "Firewall context"
+  echo "----------------"
   if have_cmd ufw; then
-    ufw status | sed -n '1,40p'
+    printf "  UFW: %s\n" "$(warn_ufw_status)"
+    echo "  Note: this tool only manages nft table inet $table."
   else
-    echo "ufw not installed"
+    echo "  UFW: not installed"
+    echo "  Note: this tool only manages nft table inet $table."
   fi
 
   echo
