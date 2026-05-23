@@ -65,8 +65,15 @@ ENSURE_UFW_ALLOW=0
 
 ## Status
 
+Human-friendly status summary:
+
 ```bash
 sudo bash install-xui-ddns-allowlist.sh --status
+```
+
+Low-level troubleshooting:
+
+```bash
 sudo nft list table inet xui_ddns_guard
 sudo systemctl list-timers xui-ddns-allowlist.timer
 sudo journalctl -u xui-ddns-allowlist.service -n 50 --no-pager

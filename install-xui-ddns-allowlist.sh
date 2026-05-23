@@ -562,27 +562,130 @@ uninstall_all() {
 
 status_all() {
   require_root
-  if [ -f "$CONFIG" ]; then
-    echo "=== config ==="
-    sed -n '1,120p' "$CONFIG"
-  else
-    echo "Config not found: $CONFIG"
-  fi
-  echo
-  echo "=== timer ==="
-  systemctl list-timers --no-pager --all "$(basename "$TIMER")" || true
-  echo
-  echo "=== service log ==="
-  journalctl -u "$(basename "$SERVICE")" -n 30 --no-pager || true
-  echo
-  echo "=== nft ==="
   local table="${TABLE:-$DEFAULT_TABLE}"
+  local set4="${SET4:-$DEFAULT_SET4}"
+  local set6="${SET6:-$DEFAULT_SET6}"
+  local ports="${PORTS:-$DEFAULT_PORTS}"
+  local domains="${DDNS_DOMAINS:-${DDNS_DOMAIN:-$DEFAULT_DDNS_DOMAINS}}"
+  local resolvers="${RESOLVERS:-$DEFAULT_RESOLVERS}"
+  local grace="${GRACE_SECONDS:-$DEFAULT_GRACE_SECONDS}"
+  local manage_udp="${MANAGE_UDP:-$DEFAULT_MANAGE_UDP}"
+
   if [ -f "$CONFIG" ]; then
     # shellcheck disable=SC1090
     . "$CONFIG" || true
     table="${TABLE:-$table}"
+    set4="${SET4:-$set4}"
+    set6="${SET6:-$set6}"
+    ports="${PORTS:-$ports}"
+    domains="${DDNS_DOMAINS:-${DDNS_DOMAIN:-$domains}}"
+    resolvers="${RESOLVERS:-$resolvers}"
+    grace="${GRACE_SECONDS:-$grace}"
+    manage_udp="${MANAGE_UDP:-$manage_udp}"
   fi
-  nft list table inet "$table" || true
+
+  local timer_unit service_unit guard_state timer_state timer_enabled next_timer last_log first_resolver
+  timer_unit="$(basename "$TIMER")"
+  service_unit="$(basename "$SERVICE")"
+  if nft list table inet "$table" >/dev/null 2>&1; then
+    guard_state="active"
+  else
+    guard_state="missing"
+  fi
+
+  timer_state="$(systemctl is-active "$timer_unit" 2>/dev/null || true)"
+  timer_enabled="$(systemctl is-enabled "$timer_unit" 2>/dev/null || true)"
+  next_timer="$(systemctl list-timers --no-pager --all "$timer_unit" 2>/dev/null | awk 'NR==2 {print $1, $2, $3, $4, $5}')"
+  last_log="$(journalctl -u "$service_unit" -n 40 -o cat --no-pager 2>/dev/null | grep -E 'updated allowlist|ERROR:' | tail -n 1 || true)"
+  first_resolver="$(normalize_list "$resolvers" | awk '{print $1}')"
+
+  echo "xui-ddns-allowlist status"
+  echo "========================="
+  printf "Guard:            %s (nft table inet %s)\n" "$guard_state" "$table"
+  printf "Protected ports:  %s/tcp" "$(normalize_list "$ports")"
+  if [ "$manage_udp" = "1" ]; then
+    printf " and %s/udp" "$(normalize_list "$ports")"
+  fi
+  printf "\n"
+  printf "Timer:            %s, %s\n" "${timer_state:-unknown}" "${timer_enabled:-unknown}"
+  if [ -n "$next_timer" ]; then
+    printf "Next refresh:     %s\n" "$next_timer"
+  fi
+  printf "Grace window:     %ss\n" "$grace"
+  printf "Config:           %s\n" "$CONFIG"
+  if [ -n "$last_log" ]; then
+    printf "Last update:      %s\n" "$last_log"
+  else
+    printf "Last update:      no update log found\n"
+  fi
+
+  echo
+  echo "DDNS domains"
+  echo "------------"
+  local domain a_records aaaa_records
+  for domain in $(normalize_list "$domains"); do
+    if [ -n "$first_resolver" ]; then
+      a_records="$(dig +short A "$domain" @"$first_resolver" 2>/dev/null | xargs || true)"
+      aaaa_records="$(dig +short AAAA "$domain" @"$first_resolver" 2>/dev/null | xargs || true)"
+    else
+      a_records="$(dig +short A "$domain" 2>/dev/null | xargs || true)"
+      aaaa_records="$(dig +short AAAA "$domain" 2>/dev/null | xargs || true)"
+    fi
+    if [ -z "$a_records$aaaa_records" ]; then
+      printf "  %-24s -> %s\n" "$domain" "no A/AAAA records"
+    else
+      printf "  %-24s -> %s%s%s\n" "$domain" "${a_records:-}" "$([ -n "$a_records" ] && [ -n "$aaaa_records" ] && printf ' | ')" "${aaaa_records:-}"
+    fi
+  done
+
+  echo
+  echo "Allowed source IPs"
+  echo "------------------"
+  python3 - "$table" "$set4" "$set6" <<'PYEOF'
+import re
+import subprocess
+import sys
+
+table, set4, set6 = sys.argv[1:4]
+
+def show_set(label, set_name):
+    proc = subprocess.run(
+        ["nft", "list", "set", "inet", table, set_name],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        print(f"  {label}: set missing or unreadable")
+        return
+    text = " ".join(proc.stdout.split())
+    pattern = re.compile(r"((?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]{2,})\s+timeout\s+\S+\s+expires\s+([^,}]+)")
+    rows = pattern.findall(text)
+    if not rows:
+        print(f"  {label}: none")
+        return
+    for ip, expires in rows:
+        print(f"  {label}: {ip:<39} expires in {expires.strip()}")
+
+show_set("IPv4", set4)
+show_set("IPv6", set6)
+PYEOF
+
+  echo
+  echo "UFW"
+  echo "---"
+  if have_cmd ufw; then
+    ufw status | sed -n '1,40p'
+  else
+    echo "ufw not installed"
+  fi
+
+  echo
+  echo "Useful commands"
+  echo "---------------"
+  echo "  sudo /usr/local/sbin/xui-ddns-allowlist-update"
+  echo "  sudo nft list table inet $table"
+  echo "  sudo journalctl -u $service_unit -n 50 --no-pager"
 }
 
 main() {
