@@ -17,7 +17,7 @@ Default panel port:
 
 ## Install
 
-Clone the repository, then run the installer:
+Clone the public repository, then run the installer:
 
 ```bash
 git clone https://github.com/akastrmix/xui-ddns-allowlist.git
@@ -25,39 +25,10 @@ cd xui-ddns-allowlist
 sudo bash install-xui-ddns-allowlist.sh
 ```
 
-If the repository is private, use an SSH deploy key on the VPS and clone through SSH. One-time VPS setup:
+Or as a single command:
 
 ```bash
-sudo install -d -m 700 /root/.ssh
-sudo ssh-keygen -t ed25519 -f /root/.ssh/xui-ddns-allowlist-github -N '' -C 'xui-ddns-allowlist'
-sudo cat /root/.ssh/xui-ddns-allowlist-github.pub
-```
-
-Add the printed public key to the GitHub repository under `Settings -> Deploy keys` without write access, then configure SSH:
-
-```bash
-sudo tee -a /root/.ssh/config >/dev/null <<'EOF'
-Host github.com-xui-ddns-allowlist
-    HostName github.com
-    User git
-    IdentityFile /root/.ssh/xui-ddns-allowlist-github
-    IdentitiesOnly yes
-EOF
-sudo chmod 600 /root/.ssh/config
-```
-
-Then clone and install:
-
-```bash
-git clone github.com-xui-ddns-allowlist:akastrmix/xui-ddns-allowlist.git
-cd xui-ddns-allowlist
-sudo bash install-xui-ddns-allowlist.sh
-```
-
-If you already have the script locally on the VPS:
-
-```bash
-sudo bash install-xui-ddns-allowlist.sh
+git clone https://github.com/akastrmix/xui-ddns-allowlist.git && cd xui-ddns-allowlist && sudo bash install-xui-ddns-allowlist.sh
 ```
 
 If UFW does not already allow the panel port:
