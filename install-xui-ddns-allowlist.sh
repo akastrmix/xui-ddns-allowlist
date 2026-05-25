@@ -118,7 +118,7 @@ config_get() {
     return 0
   fi
   local value
-  value="$(awk -v want="$key" '
+  if value="$(awk -v want="$key" '
     /^[[:space:]]*#/ { next }
     index($0, "=") == 0 { next }
     {
@@ -127,6 +127,7 @@ config_get() {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
       if (k == want) {
+        found = 1
         if ((v ~ /^".*"$/) || (v ~ /^\047.*\047$/)) {
           v = substr(v, 2, length(v) - 2)
         }
@@ -134,8 +135,8 @@ config_get() {
         exit
       }
     }
-  ' "$CONFIG")"
-  if [ -n "$value" ]; then
+    END { exit found ? 0 : 1 }
+  ' "$CONFIG")"; then
     printf '%s' "$value"
   else
     printf '%s' "$default_value"
@@ -397,13 +398,27 @@ def validate_config(cfg):
         raise ValueError("invalid MANAGE_UDP")
 
 
-def desired_ruleset(cfg):
+def nft_elements(state, fam, now):
+    if state is None or now is None:
+        return ""
+    parts = []
+    for ip, expiry in sorted(state[fam].items()):
+        timeout = max(1, int(expiry) - now)
+        parts.append(f"{ip} timeout {timeout}s")
+    if not parts:
+        return ""
+    return "\n        elements = { " + ", ".join(parts) + " }"
+
+
+def desired_ruleset(cfg, state=None, now=None):
     table = cfg["TABLE"]
     set4 = cfg["SET4"]
     set6 = cfg["SET6"]
     chain = cfg["CHAIN"]
     priority = int(cfg["PRIORITY"])
     ports = nft_port_expr(parse_ports(cfg["PORTS"]))
+    elements4 = nft_elements(state, "4", now)
+    elements6 = nft_elements(state, "6", now)
     udp_rules = ""
     if bool_config(cfg.get("MANAGE_UDP", "1")):
         udp_rules = f"""
@@ -413,12 +428,12 @@ def desired_ruleset(cfg):
     return f"""table inet {table} {{
     set {set4} {{
         type ipv4_addr
-        flags timeout
+        flags timeout{elements4}
     }}
 
     set {set6} {{
         type ipv6_addr
-        flags timeout
+        flags timeout{elements6}
     }}
 
     chain {chain} {{
@@ -447,11 +462,30 @@ def table_exists(cfg):
     return run(["nft", "list", "table", "inet", cfg["TABLE"]], check=False).returncode == 0
 
 
-def ensure_table(cfg, force=False):
+def table_has_only_expected_blocks(cfg):
+    proc = run(["nft", "list", "table", "inet", cfg["TABLE"]], check=False)
+    if proc.returncode != 0:
+        return False
+    expected = {
+        f"set {cfg['SET4']} {{",
+        f"set {cfg['SET6']} {{",
+        f"chain {cfg['CHAIN']} {{",
+    }
+    seen = set()
+    for raw in proc.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith("set ") or line.startswith("chain "):
+            if line not in expected:
+                return False
+            seen.add(line)
+    return seen == expected
+
+
+def ensure_table(cfg, force=False, state=None, now=None):
     if not force and check_rules(cfg):
         return False
     table = cfg["TABLE"]
-    rules = desired_ruleset(cfg)
+    rules = desired_ruleset(cfg, state=state, now=now)
     batch = rules
     if table_exists(cfg):
         batch = f"delete table inet {table}\n{rules}"
@@ -514,6 +548,8 @@ def set_has_timeout(cfg, set_name, expected_type):
 def check_rules(cfg):
     if not table_complete(cfg):
         return False
+    if not table_has_only_expected_blocks(cfg):
+        return False
     if not set_has_timeout(cfg, cfg["SET4"], "ipv4_addr"):
         return False
     if not set_has_timeout(cfg, cfg["SET6"], "ipv6_addr"):
@@ -528,7 +564,7 @@ def resolve_domains(domains, resolvers):
         details[domain] = {"4": [], "6": []}
         for resolver in resolvers:
             for rrtype, version in (("A", 4), ("AAAA", 6)):
-                cmd = ["dig", "+short", rrtype, domain]
+                cmd = ["dig", "+short", "+time=2", "+tries=1", rrtype, domain]
                 if resolver:
                     cmd.append(f"@{resolver}")
                 proc = run(cmd, check=False)
@@ -595,9 +631,14 @@ def validate_state(state, now):
         for ip, expiry in state.get(fam, {}).items():
             try:
                 parsed = ipaddress.ip_address(ip)
+            except ValueError as exc:
+                raise ValueError(f"state file has invalid IPv{version} address: {ip}") from exc
+            if parsed.version != version:
+                raise ValueError(f"state file has IPv{parsed.version} address in IPv{version} map: {ip}")
+            try:
                 expiry = int(expiry)
-            except Exception:
-                continue
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"state file has invalid expiry for {ip}: {expiry}") from exc
             if parsed.version == version and expiry > now:
                 clean[fam][str(parsed)] = expiry
     return clean
@@ -653,8 +694,12 @@ def main():
     state_path = cfg["STATE_FILE"]
     state = validate_state(load_state(state_path), now)
     if args.init_only:
-        created = ensure_table(cfg, force=args.force_table)
-        apply_sets(cfg, state, now)
+        if not state["4"] and not state["6"]:
+            print("ERROR: no existing state to restore; refusing to create empty guard", file=sys.stderr)
+            return 2
+        created = ensure_table(cfg, force=args.force_table, state=state, now=now)
+        if not created:
+            apply_sets(cfg, state, now)
         print(
             f"guard table ready: table={cfg['TABLE']} created={created} "
             f"restored_ipv4={','.join(sorted(state['4'])) or '-'} "
@@ -674,9 +719,10 @@ def main():
             for fam in ("4", "6"):
                 for ip in list(state[fam]):
                     state[fam][ip] = expiry
-            ensure_table(cfg, force=False)
             save_state(state_path, state)
-            apply_sets(cfg, state, now)
+            created = ensure_table(cfg, force=False, state=state, now=now)
+            if not created:
+                apply_sets(cfg, state, now)
             print(
                 f"WARNING: no valid A/AAAA records resolved for {', '.join(domains)}; "
                 f"extended stale allowlist for {grace}s",
@@ -695,9 +741,10 @@ def main():
         for ip in resolved[fam]:
             state[fam][ip] = expiry
     state = validate_state(state, now)
-    ensure_table(cfg, force=args.force_table)
     save_state(state_path, state)
-    apply_sets(cfg, state, now)
+    created = ensure_table(cfg, force=args.force_table, state=state, now=now)
+    if not created:
+        apply_sets(cfg, state, now)
     print(
         "updated allowlist: "
         f"domains={','.join(domains)} "
@@ -975,7 +1022,7 @@ status_all() {
   timer_state="$(systemctl is-active "$timer_unit" 2>/dev/null || true)"
   timer_enabled="$(systemctl is-enabled "$timer_unit" 2>/dev/null || true)"
   next_timer="$(systemctl list-timers --no-pager --all "$timer_unit" 2>/dev/null | awk 'NR==2 {print $1, $2, $3, $4, $5}')"
-  last_log="$(journalctl -u "$service_unit" -n 40 -o cat --no-pager 2>/dev/null | grep -E 'updated allowlist|ERROR:' | tail -n 1 || true)"
+  last_log="$(journalctl -u "$service_unit" -n 40 -o cat --no-pager 2>/dev/null | grep -E 'updated allowlist|WARNING:|ERROR:' | tail -n 1 || true)"
   first_resolver="$(normalize_list "$resolvers" | awk '{print $1}')"
 
   echo "xui-ddns-allowlist status"
