@@ -11,6 +11,8 @@ Default allowlist domains:
 - `hkbn.akastrmix.com`
 - `hinet.akastrmix.com`
 
+The repo copy of this list lives in `allowlist-domains.txt`.
+
 Default panel port:
 
 - `9621`
@@ -48,6 +50,18 @@ sudo bash install-xui-ddns-allowlist.sh
 Existing `/etc/default/xui-ddns-allowlist` values are preserved during updates. Pass environment variables again only when you intentionally want to change the installed configuration.
 
 Use `DDNS_DOMAINS` for one or more names. The older singular `DDNS_DOMAIN` key is intentionally rejected instead of being guessed.
+
+## Update Domains
+
+For the fastest allowlist update workflow, edit `allowlist-domains.txt` in the repo, commit and push it, then run this on each VPS:
+
+```bash
+cd xui-ddns-allowlist
+git pull
+sudo bash install-xui-ddns-allowlist.sh --sync-domains
+```
+
+`--sync-domains` applies the repo domain list to `/etc/default/xui-ddns-allowlist`, refreshes the guard, and preserves the other local settings such as ports, resolvers, grace window, and timer interval.
 
 ## Customize
 

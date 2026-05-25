@@ -12,6 +12,8 @@ SERVICE="/etc/systemd/system/xui-ddns-allowlist.service"
 TIMER="/etc/systemd/system/xui-ddns-allowlist.timer"
 INIT_SERVICE="/etc/systemd/system/xui-ddns-guard-init.service"
 STATE_DIR="/var/lib/xui-ddns-allowlist"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+DEFAULT_DOMAINS_FILE="$SCRIPT_DIR/allowlist-domains.txt"
 
 DEFAULT_DDNS_DOMAINS="hkt.akastrmix.com cmhk.akastrmix.com hkbn.akastrmix.com hinet.akastrmix.com"
 DEFAULT_PORTS="9621"
@@ -30,7 +32,7 @@ DEFAULT_STATE_FILE="$STATE_DIR/state.json"
 usage() {
   cat <<'EOF'
 Usage:
-  sudo bash install-xui-ddns-allowlist.sh [--install|--uninstall|--status]
+  sudo bash install-xui-ddns-allowlist.sh [--install|--sync-domains|--uninstall|--status]
 
 Environment overrides:
   DDNS_DOMAINS="hkt.akastrmix.com cmhk.akastrmix.com hkbn.akastrmix.com hinet.akastrmix.com"
@@ -43,6 +45,7 @@ Environment overrides:
 
 Examples:
   sudo DDNS_DOMAINS="hkt.akastrmix.com cmhk.akastrmix.com" PORTS="9621" bash install-xui-ddns-allowlist.sh
+  sudo bash install-xui-ddns-allowlist.sh --sync-domains
   sudo bash install-xui-ddns-allowlist.sh --status
   sudo bash install-xui-ddns-allowlist.sh --uninstall
 EOF
@@ -82,6 +85,22 @@ install_packages_if_needed() {
 
 normalize_list() {
   printf '%s' "$1" | tr ',' ' ' | xargs
+}
+
+repo_default_ddns_domains() {
+  if [ -f "$DEFAULT_DOMAINS_FILE" ]; then
+    awk '
+      /^[[:space:]]*#/ { next }
+      {
+        gsub(/#.*/, "")
+        for (i = 1; i <= NF; i++) {
+          print $i
+        }
+      }
+    ' "$DEFAULT_DOMAINS_FILE" | xargs
+  else
+    printf '%s' "$DEFAULT_DDNS_DOMAINS"
+  fi
 }
 
 is_truthy() {
@@ -165,6 +184,8 @@ env_or_config() {
 }
 
 load_effective_config() {
+  local default_domains
+  default_domains="$(repo_default_ddns_domains)"
   if [ "${DDNS_DOMAIN+x}" = "x" ] || config_has_key DDNS_DOMAIN; then
     echo "ERROR: DDNS_DOMAIN is not supported; use DDNS_DOMAINS." >&2
     exit 1
@@ -172,7 +193,7 @@ load_effective_config() {
   if [ "${DDNS_DOMAINS+x}" = "x" ]; then
     EFFECTIVE_DDNS_DOMAINS="$DDNS_DOMAINS"
   else
-    EFFECTIVE_DDNS_DOMAINS="$(config_get DDNS_DOMAINS "$DEFAULT_DDNS_DOMAINS")"
+    EFFECTIVE_DDNS_DOMAINS="$(config_get DDNS_DOMAINS "$default_domains")"
   fi
   EFFECTIVE_DDNS_DOMAINS="$(normalize_list "$EFFECTIVE_DDNS_DOMAINS")"
   EFFECTIVE_PORTS="$(normalize_list "$(env_or_config PORTS PORTS "$DEFAULT_PORTS")")"
@@ -901,6 +922,13 @@ install_all() {
   print_install_summary
 }
 
+sync_domains_all() {
+  local domains
+  domains="$(repo_default_ddns_domains)"
+  [ -n "$domains" ] || { echo "ERROR: $DEFAULT_DOMAINS_FILE has no domains." >&2; exit 1; }
+  DDNS_DOMAINS="$domains" install_all
+}
+
 uninstall_all() {
   require_root
   local table
@@ -1046,6 +1074,9 @@ main() {
   case "$action" in
     --install|-i)
       install_all
+      ;;
+    --sync-domains)
+      sync_domains_all
       ;;
     --uninstall)
       uninstall_all
