@@ -93,6 +93,15 @@ The uninstall command removes the systemd units, updater script, and nftables gu
 
 Uninstall does not remove UFW rules. If UFW allows the panel port, removing this guard can make that port public again.
 
+## Design
+
+This is intentionally a small guard, not a general firewall manager.
+
+- It only manages its own nftables table, systemd units, updater script, config file, and state directory.
+- It does not guess legacy or ambiguous configuration. Invalid config fails fast and leaves the current kernel rules untouched.
+- It rebuilds the guard table when the active rule shape drifts from the expected generated shape.
+- It keeps old resolved IPs briefly for DDNS changes, but it does not try to infer per-domain intent from partial DNS failures.
+
 ## Notes
 
 - UFW should still allow the configured panel port. This nftables guard only pre-filters source IPs before UFW.
