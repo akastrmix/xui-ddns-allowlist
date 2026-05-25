@@ -1,6 +1,6 @@
 # xui-ddns-allowlist
 
-Dynamic DDNS source allowlist for x-ui / 3x-ui panel ports on Debian 12/13 hosts with UFW.
+Dynamic DDNS source allowlist for x-ui / 3x-ui panel ports on Debian 12/13 systemd hosts with UFW.
 
 The installer creates a small nftables guard that runs before UFW. It resolves configured DDNS names every minute and only allows those current or recently seen IPs to reach the configured panel port.
 
@@ -45,6 +45,8 @@ git pull
 sudo bash install-xui-ddns-allowlist.sh
 ```
 
+Existing `/etc/default/xui-ddns-allowlist` values are preserved during updates. Pass environment variables again only when you intentionally want to change the installed configuration.
+
 ## Customize
 
 ```bash
@@ -87,8 +89,11 @@ sudo bash install-xui-ddns-allowlist.sh --uninstall
 
 The uninstall command removes the systemd units, updater script, and nftables guard table. It keeps `/etc/default/xui-ddns-allowlist` and `/var/lib/xui-ddns-allowlist` for inspection or later reuse.
 
+Uninstall does not remove UFW rules. If UFW allows the panel port, removing this guard can make that port public again.
+
 ## Notes
 
 - UFW should still allow the configured panel port. This nftables guard only pre-filters source IPs before UFW.
-- If DNS resolution fails, the updater keeps the existing allowlist instead of clearing it.
+- First install requires at least one DDNS domain to resolve. If DNS fails and no previous state exists, the installer exits without creating an empty drop-only guard.
+- If DNS resolution later fails, the updater extends the existing state for another `GRACE_SECONDS` instead of clearing it.
 - Old resolved IPs remain allowed for `GRACE_SECONDS` to reduce lockout risk during DDNS changes.

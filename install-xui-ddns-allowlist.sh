@@ -25,6 +25,7 @@ DEFAULT_CHAIN="input"
 DEFAULT_PRIORITY="-100"
 DEFAULT_MANAGE_UDP="1"
 DEFAULT_ENSURE_UFW_ALLOW="0"
+DEFAULT_STATE_FILE="$STATE_DIR/state.json"
 
 usage() {
   cat <<'EOF'
@@ -83,6 +84,142 @@ normalize_list() {
   printf '%s' "$1" | tr ',' ' ' | xargs
 }
 
+is_truthy() {
+  case "$1" in
+    1|true|True|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+config_get() {
+  local key="$1"
+  local default_value="$2"
+  if [ ! -f "$CONFIG" ]; then
+    printf '%s' "$default_value"
+    return 0
+  fi
+  local value
+  value="$(awk -v want="$key" '
+    /^[[:space:]]*#/ { next }
+    index($0, "=") == 0 { next }
+    {
+      k = substr($0, 1, index($0, "=") - 1)
+      v = substr($0, index($0, "=") + 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      if (k == want) {
+        if ((v ~ /^".*"$/) || (v ~ /^\047.*\047$/)) {
+          v = substr(v, 2, length(v) - 2)
+        }
+        print v
+        exit
+      }
+    }
+  ' "$CONFIG")"
+  if [ -n "$value" ]; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$default_value"
+  fi
+}
+
+env_or_config() {
+  local env_name="$1"
+  local config_key="$2"
+  local default_value="$3"
+  if [ "${!env_name+x}" = "x" ]; then
+    printf '%s' "${!env_name}"
+  else
+    config_get "$config_key" "$default_value"
+  fi
+}
+
+load_effective_config() {
+  if [ "${DDNS_DOMAINS+x}" = "x" ]; then
+    EFFECTIVE_DDNS_DOMAINS="$DDNS_DOMAINS"
+  elif [ "${DDNS_DOMAIN+x}" = "x" ]; then
+    EFFECTIVE_DDNS_DOMAINS="$DDNS_DOMAIN"
+  else
+    EFFECTIVE_DDNS_DOMAINS="$(config_get DDNS_DOMAINS "$DEFAULT_DDNS_DOMAINS")"
+    if [ -z "$(normalize_list "$EFFECTIVE_DDNS_DOMAINS")" ]; then
+      EFFECTIVE_DDNS_DOMAINS="$(config_get DDNS_DOMAIN "$DEFAULT_DDNS_DOMAINS")"
+    fi
+  fi
+  EFFECTIVE_DDNS_DOMAINS="$(normalize_list "$EFFECTIVE_DDNS_DOMAINS")"
+  EFFECTIVE_PORTS="$(normalize_list "$(env_or_config PORTS PORTS "$DEFAULT_PORTS")")"
+  EFFECTIVE_RESOLVERS="$(normalize_list "$(env_or_config RESOLVERS RESOLVERS "$DEFAULT_RESOLVERS")")"
+  EFFECTIVE_GRACE_SECONDS="$(env_or_config GRACE_SECONDS GRACE_SECONDS "$DEFAULT_GRACE_SECONDS")"
+  EFFECTIVE_INTERVAL_SECONDS="$(env_or_config INTERVAL_SECONDS INTERVAL_SECONDS "$DEFAULT_INTERVAL_SECONDS")"
+  EFFECTIVE_TABLE="$(env_or_config TABLE TABLE "$DEFAULT_TABLE")"
+  EFFECTIVE_SET4="$(env_or_config SET4 SET4 "$DEFAULT_SET4")"
+  EFFECTIVE_SET6="$(env_or_config SET6 SET6 "$DEFAULT_SET6")"
+  EFFECTIVE_CHAIN="$(env_or_config CHAIN CHAIN "$DEFAULT_CHAIN")"
+  EFFECTIVE_PRIORITY="$(env_or_config PRIORITY PRIORITY "$DEFAULT_PRIORITY")"
+  EFFECTIVE_MANAGE_UDP="$(env_or_config MANAGE_UDP MANAGE_UDP "$DEFAULT_MANAGE_UDP")"
+  EFFECTIVE_STATE_FILE="$(env_or_config STATE_FILE STATE_FILE "$DEFAULT_STATE_FILE")"
+}
+
+validate_effective_config() {
+  local item
+  [ -n "$EFFECTIVE_DDNS_DOMAINS" ] || { echo "ERROR: DDNS_DOMAINS cannot be empty." >&2; exit 1; }
+  [ -n "$EFFECTIVE_PORTS" ] || { echo "ERROR: PORTS cannot be empty." >&2; exit 1; }
+  for item in $EFFECTIVE_DDNS_DOMAINS; do
+    case "$item" in
+      *[!A-Za-z0-9._-]* | .* | *..* | *.) echo "ERROR: invalid DDNS domain: $item" >&2; exit 1 ;;
+    esac
+  done
+  for item in $EFFECTIVE_PORTS; do
+    case "$item" in
+      *[!0-9]* | "") echo "ERROR: invalid port: $item" >&2; exit 1 ;;
+    esac
+    if [ "$item" -lt 1 ] || [ "$item" -gt 65535 ]; then
+      echo "ERROR: invalid port: $item" >&2
+      exit 1
+    fi
+  done
+  for item in $EFFECTIVE_RESOLVERS; do
+    case "$item" in
+      *[!0-9A-Fa-f:.]* | "") echo "ERROR: invalid resolver: $item" >&2; exit 1 ;;
+    esac
+  done
+  case "$EFFECTIVE_GRACE_SECONDS" in *[!0-9]* | "") echo "ERROR: invalid GRACE_SECONDS." >&2; exit 1 ;; esac
+  case "$EFFECTIVE_INTERVAL_SECONDS" in *[!0-9]* | "") echo "ERROR: invalid INTERVAL_SECONDS." >&2; exit 1 ;; esac
+  if [ "$EFFECTIVE_GRACE_SECONDS" -lt 1 ]; then
+    echo "ERROR: GRACE_SECONDS must be positive." >&2
+    exit 1
+  fi
+  if [ "$EFFECTIVE_INTERVAL_SECONDS" -lt 1 ]; then
+    echo "ERROR: INTERVAL_SECONDS must be positive." >&2
+    exit 1
+  fi
+  for item in "$EFFECTIVE_TABLE" "$EFFECTIVE_SET4" "$EFFECTIVE_SET6" "$EFFECTIVE_CHAIN"; do
+    case "$item" in
+      "" | [0-9]* | *[!A-Za-z0-9_]*)
+        echo "ERROR: TABLE/SET/CHAIN names may only contain letters, numbers, and underscores, and cannot start with a number." >&2
+        exit 1
+        ;;
+    esac
+  done
+  case "$EFFECTIVE_PRIORITY" in -*) item="${EFFECTIVE_PRIORITY#-}" ;; *) item="$EFFECTIVE_PRIORITY" ;; esac
+  case "$item" in *[!0-9]* | "") echo "ERROR: invalid PRIORITY." >&2; exit 1 ;; esac
+  case "$EFFECTIVE_MANAGE_UDP" in 0|1|true|false|True|False|yes|no|YES|NO|on|off|ON|OFF) ;; *) echo "ERROR: invalid MANAGE_UDP." >&2; exit 1 ;; esac
+  case "$EFFECTIVE_STATE_FILE" in
+    /*) ;;
+    *) echo "ERROR: STATE_FILE must be an absolute path." >&2; exit 1 ;;
+  esac
+  if printf '%s' "$EFFECTIVE_STATE_FILE" | grep -q '[[:cntrl:]]'; then
+    echo "ERROR: invalid STATE_FILE." >&2
+    exit 1
+  fi
+}
+
+require_systemd_running() {
+  if ! have_cmd systemctl || [ ! -d /run/systemd/system ]; then
+    echo "ERROR: this installer requires a systemd-based host." >&2
+    exit 1
+  fi
+}
+
 write_updater() {
   install -d -m 0755 "$(dirname "$UPDATER")"
   cat > "$UPDATER" <<'PYEOF'
@@ -91,6 +228,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -111,6 +249,9 @@ DEFAULTS = {
     "MANAGE_UDP": "1",
     "STATE_FILE": "/var/lib/xui-ddns-allowlist/state.json",
 }
+
+NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+DOMAIN_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def load_config(path):
@@ -185,6 +326,29 @@ def bool_config(value):
     return str(value).strip() not in ("0", "false", "False", "no", "NO", "off", "OFF")
 
 
+def validate_config(cfg):
+    for key in ("TABLE", "SET4", "SET6", "CHAIN"):
+        if not NAME_RE.match(str(cfg[key])):
+            raise ValueError(f"{key} must contain only letters, numbers, and underscores, and cannot start with a number")
+    int(cfg["PRIORITY"])
+    grace = int(cfg["GRACE_SECONDS"])
+    if grace < 1:
+        raise ValueError("GRACE_SECONDS must be positive")
+    parse_ports(cfg["PORTS"])
+    for domain in configured_domains(cfg):
+        if not DOMAIN_RE.match(domain) or domain.startswith(".") or domain.endswith(".") or ".." in domain:
+            raise ValueError(f"invalid DDNS domain: {domain}")
+    for resolver in split_words(cfg["RESOLVERS"]):
+        try:
+            ipaddress.ip_address(resolver)
+        except ValueError as exc:
+            raise ValueError(f"invalid resolver: {resolver}") from exc
+    if not os.path.isabs(cfg["STATE_FILE"]) or "\n" in cfg["STATE_FILE"] or "\r" in cfg["STATE_FILE"]:
+        raise ValueError("STATE_FILE must be an absolute path")
+    if str(cfg.get("MANAGE_UDP", "1")).strip() not in ("0", "1", "true", "false", "True", "False", "yes", "no", "YES", "NO", "on", "off", "ON", "OFF"):
+        raise ValueError("invalid MANAGE_UDP")
+
+
 def desired_ruleset(cfg):
     table = cfg["TABLE"]
     set4 = cfg["SET4"]
@@ -231,15 +395,45 @@ def table_complete(cfg):
     return all(run(cmd, check=False).returncode == 0 for cmd in checks)
 
 
+def table_exists(cfg):
+    return run(["nft", "list", "table", "inet", cfg["TABLE"]], check=False).returncode == 0
+
+
 def ensure_table(cfg, force=False):
-    if table_complete(cfg) and not force:
+    if not force and check_rules(cfg):
         return False
     table = cfg["TABLE"]
-    run(["nft", "delete", "table", "inet", table], check=False)
     rules = desired_ruleset(cfg)
-    run(["nft", "-c", "-f", "-"], input_text=rules)
-    run(["nft", "-f", "-"], input_text=rules)
+    batch = rules
+    if table_exists(cfg):
+        batch = f"delete table inet {table}\n{rules}"
+    run(["nft", "-c", "-f", "-"], input_text=batch)
+    run(["nft", "-f", "-"], input_text=batch)
     return True
+
+
+def check_rules(cfg):
+    if not table_complete(cfg):
+        return False
+    proc = run(["nft", "list", "chain", "inet", cfg["TABLE"], cfg["CHAIN"]], check=False)
+    if proc.returncode != 0:
+        return False
+    actual = " ".join(proc.stdout.split())
+    ports = " ".join(nft_port_expr(parse_ports(cfg["PORTS"])).split())
+    priority = int(cfg["PRIORITY"])
+    checks = [
+        f"type filter hook input priority {priority}; policy accept;",
+        f"tcp dport {ports} ip saddr @{cfg['SET4']} accept",
+        f"tcp dport {ports} ip6 saddr @{cfg['SET6']} accept",
+        f"tcp dport {ports} drop",
+    ]
+    if bool_config(cfg.get("MANAGE_UDP", "1")):
+        checks.extend([
+            f"udp dport {ports} ip saddr @{cfg['SET4']} accept",
+            f"udp dport {ports} ip6 saddr @{cfg['SET6']} accept",
+            f"udp dport {ports} drop",
+        ])
+    return all(item in actual for item in checks)
 
 
 def resolve_domains(domains, resolvers):
@@ -345,15 +539,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--init-only", action="store_true", help="create nft guard only; do not resolve DNS")
     parser.add_argument("--force-table", action="store_true", help="rebuild the nft guard table")
+    parser.add_argument("--check-rules", action="store_true", help="verify the active nft guard shape")
     parser.add_argument("--print-config", action="store_true")
     args = parser.parse_args()
 
     cfg = load_config(CONFIG_PATH)
+    validate_config(cfg)
     domains = configured_domains(cfg)
-    created = ensure_table(cfg, force=args.force_table)
-    if args.init_only:
-        print(f"guard table ready: table={cfg['TABLE']} created={created}")
-        return 0
+    if args.check_rules:
+        if check_rules(cfg):
+            print("guard rules match expected configuration")
+            return 0
+        print("guard rules do not match expected configuration", file=sys.stderr)
+        return 3
     if args.print_config:
         print(json.dumps({**cfg, "DOMAINS": domains}, indent=2, sort_keys=True))
         return 0
@@ -361,14 +559,39 @@ def main():
     now = int(time.time())
     state_path = cfg["STATE_FILE"]
     state = validate_state(load_state(state_path), now)
+    if args.init_only:
+        created = ensure_table(cfg, force=args.force_table)
+        apply_sets(cfg, state, now)
+        print(
+            f"guard table ready: table={cfg['TABLE']} created={created} "
+            f"restored_ipv4={','.join(sorted(state['4'])) or '-'} "
+            f"restored_ipv6={','.join(sorted(state['6'])) or '-'}"
+        )
+        return 0
+
     resolvers = split_words(cfg["RESOLVERS"])
     if not resolvers:
         resolvers = [""]
     resolved, details = resolve_domains(domains, resolvers)
     resolved_count = len(resolved["4"]) + len(resolved["6"])
     if resolved_count == 0:
+        if state["4"] or state["6"]:
+            grace = int(cfg["GRACE_SECONDS"])
+            expiry = now + grace
+            for fam in ("4", "6"):
+                for ip in list(state[fam]):
+                    state[fam][ip] = expiry
+            ensure_table(cfg, force=False)
+            save_state(state_path, state)
+            apply_sets(cfg, state, now)
+            print(
+                f"WARNING: no valid A/AAAA records resolved for {', '.join(domains)}; "
+                f"extended stale allowlist for {grace}s",
+                file=sys.stderr,
+            )
+            return 0
         print(
-            f"ERROR: no valid A/AAAA records resolved for {', '.join(domains)}; keeping existing nft set",
+            f"ERROR: no valid A/AAAA records resolved for {', '.join(domains)}; no existing state to restore",
             file=sys.stderr,
         )
         return 2
@@ -379,6 +602,7 @@ def main():
         for ip in resolved[fam]:
             state[fam][ip] = expiry
     state = validate_state(state, now)
+    ensure_table(cfg, force=args.force_table)
     save_state(state_path, state)
     apply_sets(cfg, state, now)
     print(
@@ -404,45 +628,62 @@ PYEOF
 
 write_config() {
   install -d -m 0755 "$(dirname "$CONFIG")"
-
-  local ddns_domains="${DDNS_DOMAINS:-${DDNS_DOMAIN:-$DEFAULT_DDNS_DOMAINS}}"
-  ddns_domains="$(normalize_list "$ddns_domains")"
-  local ports="${PORTS:-$DEFAULT_PORTS}"
-  ports="$(normalize_list "$ports")"
-  local resolvers="${RESOLVERS:-$DEFAULT_RESOLVERS}"
-  resolvers="$(normalize_list "$resolvers")"
-  local grace="${GRACE_SECONDS:-$DEFAULT_GRACE_SECONDS}"
-  local table="${TABLE:-$DEFAULT_TABLE}"
-  local set4="${SET4:-$DEFAULT_SET4}"
-  local set6="${SET6:-$DEFAULT_SET6}"
-  local chain="${CHAIN:-$DEFAULT_CHAIN}"
-  local priority="${PRIORITY:-$DEFAULT_PRIORITY}"
-  local manage_udp="${MANAGE_UDP:-$DEFAULT_MANAGE_UDP}"
+  load_effective_config
+  validate_effective_config
 
   if [ -f "$CONFIG" ]; then
-    cp -a "$CONFIG" "$CONFIG.bak-$(date +%s)"
+    local old new
+    old="$(mktemp)"
+    new="$(mktemp)"
+    cp -a "$CONFIG" "$old"
+    cat > "$new" <<EOF
+# Dynamic source allowlist for x-ui / 3x-ui panel ports.
+# The updater resolves these DDNS names and allows current and recent IPs only.
+DDNS_DOMAINS="$EFFECTIVE_DDNS_DOMAINS"
+PORTS="$EFFECTIVE_PORTS"
+RESOLVERS="$EFFECTIVE_RESOLVERS"
+GRACE_SECONDS="$EFFECTIVE_GRACE_SECONDS"
+INTERVAL_SECONDS="$EFFECTIVE_INTERVAL_SECONDS"
+TABLE="$EFFECTIVE_TABLE"
+SET4="$EFFECTIVE_SET4"
+SET6="$EFFECTIVE_SET6"
+CHAIN="$EFFECTIVE_CHAIN"
+PRIORITY="$EFFECTIVE_PRIORITY"
+MANAGE_UDP="$EFFECTIVE_MANAGE_UDP"
+STATE_FILE="$EFFECTIVE_STATE_FILE"
+EOF
+    if ! cmp -s "$old" "$new"; then
+      cp -a "$CONFIG" "$CONFIG.bak-$(date +%s)"
+      cat "$new" > "$CONFIG"
+    fi
+    rm -f "$old" "$new"
+    chmod 0644 "$CONFIG"
+    return 0
   fi
 
   cat > "$CONFIG" <<EOF
 # Dynamic source allowlist for x-ui / 3x-ui panel ports.
 # The updater resolves these DDNS names and allows current and recent IPs only.
-DDNS_DOMAINS="$ddns_domains"
-PORTS="$ports"
-RESOLVERS="$resolvers"
-GRACE_SECONDS="$grace"
-TABLE="$table"
-SET4="$set4"
-SET6="$set6"
-CHAIN="$chain"
-PRIORITY="$priority"
-MANAGE_UDP="$manage_udp"
-STATE_FILE="$STATE_DIR/state.json"
+DDNS_DOMAINS="$EFFECTIVE_DDNS_DOMAINS"
+PORTS="$EFFECTIVE_PORTS"
+RESOLVERS="$EFFECTIVE_RESOLVERS"
+GRACE_SECONDS="$EFFECTIVE_GRACE_SECONDS"
+INTERVAL_SECONDS="$EFFECTIVE_INTERVAL_SECONDS"
+TABLE="$EFFECTIVE_TABLE"
+SET4="$EFFECTIVE_SET4"
+SET6="$EFFECTIVE_SET6"
+CHAIN="$EFFECTIVE_CHAIN"
+PRIORITY="$EFFECTIVE_PRIORITY"
+MANAGE_UDP="$EFFECTIVE_MANAGE_UDP"
+STATE_FILE="$EFFECTIVE_STATE_FILE"
 EOF
   chmod 0644 "$CONFIG"
 }
 
 write_systemd_units() {
-  local interval="${INTERVAL_SECONDS:-$DEFAULT_INTERVAL_SECONDS}"
+  load_effective_config
+  validate_effective_config
+  local interval="$EFFECTIVE_INTERVAL_SECONDS"
 
   cat > "$SERVICE" <<EOF
 [Unit]
@@ -502,8 +743,9 @@ maybe_ensure_ufw_allow() {
     echo "WARN: ENSURE_UFW_ALLOW=1 but ufw is not installed." >&2
     return 0
   fi
-  local ports="${PORTS:-$DEFAULT_PORTS}"
-  ports="$(normalize_list "$ports")"
+  load_effective_config
+  validate_effective_config
+  local ports="$EFFECTIVE_PORTS"
   local port
   for port in $ports; do
     ufw allow "$port" >/dev/null || true
@@ -523,54 +765,49 @@ warn_ufw_status() {
 }
 
 print_install_summary() {
-  local table="${TABLE:-$DEFAULT_TABLE}"
-  local set4="${SET4:-$DEFAULT_SET4}"
-  local ports="${PORTS:-$DEFAULT_PORTS}"
-  local domains="${DDNS_DOMAINS:-${DDNS_DOMAIN:-$DEFAULT_DDNS_DOMAINS}}"
   local timer_unit
   timer_unit="$(basename "$TIMER")"
-  if [ -f "$CONFIG" ]; then
-    # shellcheck disable=SC1090
-    . "$CONFIG" || true
-    table="${TABLE:-$table}"
-    set4="${SET4:-$set4}"
-    ports="${PORTS:-$ports}"
-    domains="${DDNS_DOMAINS:-${DDNS_DOMAIN:-$domains}}"
-  fi
+  load_effective_config
+  validate_effective_config
 
   echo
   echo "xui-ddns-allowlist installed"
   echo "==========================="
-  printf "Protected ports:  %s\n" "$(normalize_list "$ports")"
-  printf "DDNS domains:     %s\n" "$(normalize_list "$domains")"
+  printf "Protected ports:  %s\n" "$EFFECTIVE_PORTS"
+  printf "DDNS domains:     %s\n" "$EFFECTIVE_DDNS_DOMAINS"
   printf "Timer:            %s, %s\n" "$(systemctl is-active "$timer_unit" 2>/dev/null || true)" "$(systemctl is-enabled "$timer_unit" 2>/dev/null || true)"
   printf "UFW:              %s\n" "$(warn_ufw_status)"
   printf "Config:           %s\n" "$CONFIG"
   echo
   echo "Allowed source IPs"
   echo "------------------"
-  python3 - "$table" "$set4" <<'PYEOF'
+  python3 - "$EFFECTIVE_TABLE" "$EFFECTIVE_SET4" "$EFFECTIVE_SET6" <<'PYEOF'
 import re
 import subprocess
 import sys
 
-table, set4 = sys.argv[1:3]
-proc = subprocess.run(
-    ["nft", "list", "set", "inet", table, set4],
-    text=True,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-)
-if proc.returncode != 0:
-    print("  set missing or unreadable")
-else:
+table, set4, set6 = sys.argv[1:4]
+
+def show(label, set_name):
+    proc = subprocess.run(
+        ["nft", "list", "set", "inet", table, set_name],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        print(f"  {label}: set missing or unreadable")
+        return
     text = " ".join(proc.stdout.split())
-    rows = re.findall(r"((?:\d{1,3}\.){3}\d{1,3})\s+timeout\s+\S+\s+expires\s+([^,}]+)", text)
+    rows = re.findall(r"((?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]{2,})\s+timeout\s+\S+\s+expires\s+([^,}]+)", text)
     if not rows:
-        print("  none")
+        print(f"  {label}: none")
     else:
         for ip, expires in rows:
-            print(f"  {ip:<15} expires in {expires.strip()}")
+            print(f"  {label}: {ip:<39} expires in {expires.strip()}")
+
+show("IPv4", set4)
+show("IPv6", set6)
 PYEOF
   echo
   echo "Check later:"
@@ -579,6 +816,7 @@ PYEOF
 
 install_all() {
   require_root
+  require_systemd_running
   install_packages_if_needed
   install -d -m 0700 "$STATE_DIR"
   write_updater
@@ -586,20 +824,15 @@ install_all() {
   write_systemd_units
   maybe_ensure_ufw_allow
   systemctl daemon-reload
-  "$UPDATER" --force-table --init-only
-  "$UPDATER"
+  "$UPDATER" --force-table
   systemctl enable --now "$(basename "$INIT_SERVICE")" "$(basename "$TIMER")"
   print_install_summary
 }
 
 uninstall_all() {
   require_root
-  local table="${TABLE:-$DEFAULT_TABLE}"
-  if [ -f "$CONFIG" ]; then
-    # shellcheck disable=SC1090
-    . "$CONFIG" || true
-    table="${TABLE:-$table}"
-  fi
+  local table
+  table="$(config_get TABLE "$DEFAULT_TABLE")"
   systemctl disable --now "$(basename "$TIMER")" "$(basename "$INIT_SERVICE")" >/dev/null 2>&1 || true
   systemctl stop "$(basename "$SERVICE")" >/dev/null 2>&1 || true
   nft delete table inet "$table" >/dev/null 2>&1 || true
@@ -608,40 +841,35 @@ uninstall_all() {
   echo "Uninstalled $SCRIPT_NAME. Config and state were kept:"
   echo "  $CONFIG"
   echo "  $STATE_DIR"
+  echo "UFW rules were not changed. If UFW allows the panel port, it may now be public."
   echo "Remove them manually if no longer needed."
 }
 
 status_all() {
   require_root
-  local table="${TABLE:-$DEFAULT_TABLE}"
-  local set4="${SET4:-$DEFAULT_SET4}"
-  local set6="${SET6:-$DEFAULT_SET6}"
-  local ports="${PORTS:-$DEFAULT_PORTS}"
-  local domains="${DDNS_DOMAINS:-${DDNS_DOMAIN:-$DEFAULT_DDNS_DOMAINS}}"
-  local resolvers="${RESOLVERS:-$DEFAULT_RESOLVERS}"
-  local grace="${GRACE_SECONDS:-$DEFAULT_GRACE_SECONDS}"
-  local manage_udp="${MANAGE_UDP:-$DEFAULT_MANAGE_UDP}"
+  load_effective_config
+  validate_effective_config
+  local table="$EFFECTIVE_TABLE"
+  local set4="$EFFECTIVE_SET4"
+  local set6="$EFFECTIVE_SET6"
+  local ports="$EFFECTIVE_PORTS"
+  local domains="$EFFECTIVE_DDNS_DOMAINS"
+  local resolvers="$EFFECTIVE_RESOLVERS"
+  local grace="$EFFECTIVE_GRACE_SECONDS"
+  local manage_udp="$EFFECTIVE_MANAGE_UDP"
 
-  if [ -f "$CONFIG" ]; then
-    # shellcheck disable=SC1090
-    . "$CONFIG" || true
-    table="${TABLE:-$table}"
-    set4="${SET4:-$set4}"
-    set6="${SET6:-$set6}"
-    ports="${PORTS:-$ports}"
-    domains="${DDNS_DOMAINS:-${DDNS_DOMAIN:-$domains}}"
-    resolvers="${RESOLVERS:-$resolvers}"
-    grace="${GRACE_SECONDS:-$grace}"
-    manage_udp="${MANAGE_UDP:-$manage_udp}"
-  fi
-
-  local timer_unit service_unit guard_state timer_state timer_enabled next_timer last_log first_resolver
+  local timer_unit service_unit guard_state guard_rules timer_state timer_enabled next_timer last_log first_resolver
   timer_unit="$(basename "$TIMER")"
   service_unit="$(basename "$SERVICE")"
   if nft list table inet "$table" >/dev/null 2>&1; then
     guard_state="active"
   else
     guard_state="missing"
+  fi
+  if [ -x "$UPDATER" ] && "$UPDATER" --check-rules >/dev/null 2>&1; then
+    guard_rules="expected"
+  else
+    guard_rules="needs attention"
   fi
 
   timer_state="$(systemctl is-active "$timer_unit" 2>/dev/null || true)"
@@ -652,9 +880,9 @@ status_all() {
 
   echo "xui-ddns-allowlist status"
   echo "========================="
-  printf "Guard:            %s (nft table inet %s)\n" "$guard_state" "$table"
+  printf "Guard:            %s, rules %s (nft table inet %s)\n" "$guard_state" "$guard_rules" "$table"
   printf "Protected ports:  %s/tcp" "$(normalize_list "$ports")"
-  if [ "$manage_udp" = "1" ]; then
+  if is_truthy "$manage_udp"; then
     printf " and %s/udp" "$(normalize_list "$ports")"
   fi
   printf "\n"
