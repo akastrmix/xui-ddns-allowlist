@@ -47,6 +47,8 @@ sudo bash install-xui-ddns-allowlist.sh
 
 Existing `/etc/default/xui-ddns-allowlist` values are preserved during updates. Pass environment variables again only when you intentionally want to change the installed configuration.
 
+Use `DDNS_DOMAINS` for one or more names. The older singular `DDNS_DOMAIN` key is intentionally rejected instead of being guessed.
+
 ## Customize
 
 ```bash

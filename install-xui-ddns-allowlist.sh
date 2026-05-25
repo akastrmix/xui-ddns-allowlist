@@ -123,6 +123,36 @@ config_get() {
   fi
 }
 
+config_has_key() {
+  local key="$1"
+  [ -f "$CONFIG" ] || return 1
+  awk -v want="$key" '
+    /^[[:space:]]*#/ { next }
+    index($0, "=") == 0 { next }
+    {
+      k = substr($0, 1, index($0, "=") - 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      if (k == want) {
+        found = 1
+        exit
+      }
+    }
+    END { exit found ? 0 : 1 }
+  ' "$CONFIG"
+}
+
+is_valid_ip() {
+  python3 - "$1" <<'PYEOF'
+import ipaddress
+import sys
+
+try:
+    ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+PYEOF
+}
+
 env_or_config() {
   local env_name="$1"
   local config_key="$2"
@@ -135,15 +165,14 @@ env_or_config() {
 }
 
 load_effective_config() {
+  if [ "${DDNS_DOMAIN+x}" = "x" ] || config_has_key DDNS_DOMAIN; then
+    echo "ERROR: DDNS_DOMAIN is not supported; use DDNS_DOMAINS." >&2
+    exit 1
+  fi
   if [ "${DDNS_DOMAINS+x}" = "x" ]; then
     EFFECTIVE_DDNS_DOMAINS="$DDNS_DOMAINS"
-  elif [ "${DDNS_DOMAIN+x}" = "x" ]; then
-    EFFECTIVE_DDNS_DOMAINS="$DDNS_DOMAIN"
   else
     EFFECTIVE_DDNS_DOMAINS="$(config_get DDNS_DOMAINS "$DEFAULT_DDNS_DOMAINS")"
-    if [ -z "$(normalize_list "$EFFECTIVE_DDNS_DOMAINS")" ]; then
-      EFFECTIVE_DDNS_DOMAINS="$(config_get DDNS_DOMAIN "$DEFAULT_DDNS_DOMAINS")"
-    fi
   fi
   EFFECTIVE_DDNS_DOMAINS="$(normalize_list "$EFFECTIVE_DDNS_DOMAINS")"
   EFFECTIVE_PORTS="$(normalize_list "$(env_or_config PORTS PORTS "$DEFAULT_PORTS")")"
@@ -178,9 +207,7 @@ validate_effective_config() {
     fi
   done
   for item in $EFFECTIVE_RESOLVERS; do
-    case "$item" in
-      *[!0-9A-Fa-f:.]* | "") echo "ERROR: invalid resolver: $item" >&2; exit 1 ;;
-    esac
+    is_valid_ip "$item" || { echo "ERROR: invalid resolver: $item" >&2; exit 1; }
   done
   case "$EFFECTIVE_GRACE_SECONDS" in *[!0-9]* | "") echo "ERROR: invalid GRACE_SECONDS." >&2; exit 1 ;; esac
   case "$EFFECTIVE_INTERVAL_SECONDS" in *[!0-9]* | "") echo "ERROR: invalid INTERVAL_SECONDS." >&2; exit 1 ;; esac
@@ -237,7 +264,6 @@ import time
 CONFIG_PATH = "/etc/default/xui-ddns-allowlist"
 DEFAULTS = {
     "DDNS_DOMAINS": "hkt.akastrmix.com cmhk.akastrmix.com hkbn.akastrmix.com hinet.akastrmix.com",
-    "DDNS_DOMAIN": "",
     "PORTS": "9621",
     "RESOLVERS": "1.1.1.1,8.8.8.8,9.9.9.9",
     "GRACE_SECONDS": "900",
@@ -265,6 +291,8 @@ def load_config(path):
                 key, value = line.split("=", 1)
                 key = key.strip()
                 value = value.strip().strip('"').strip("'")
+                if key == "DDNS_DOMAIN":
+                    raise ValueError("DDNS_DOMAIN is not supported; use DDNS_DOMAINS")
                 if key:
                     cfg[key] = value
     return cfg
@@ -276,10 +304,9 @@ def split_words(value):
 
 def configured_domains(cfg):
     domains = split_words(cfg.get("DDNS_DOMAINS", ""))
-    legacy = split_words(cfg.get("DDNS_DOMAIN", ""))
     merged = []
     seen = set()
-    for domain in domains + legacy:
+    for domain in domains:
         lowered = domain.lower().rstrip(".")
         if lowered and lowered not in seen:
             seen.add(lowered)
@@ -412,28 +439,65 @@ def ensure_table(cfg, force=False):
     return True
 
 
-def check_rules(cfg):
-    if not table_complete(cfg):
-        return False
-    proc = run(["nft", "list", "chain", "inet", cfg["TABLE"], cfg["CHAIN"]], check=False)
-    if proc.returncode != 0:
-        return False
-    actual = " ".join(proc.stdout.split())
+def normalized_rule(line):
+    return " ".join(line.strip().split())
+
+
+def expected_chain_lines(cfg):
     ports = " ".join(nft_port_expr(parse_ports(cfg["PORTS"])).split())
     priority = int(cfg["PRIORITY"])
-    checks = [
+    lines = [
         f"type filter hook input priority {priority}; policy accept;",
+        'iifname "lo" accept',
         f"tcp dport {ports} ip saddr @{cfg['SET4']} accept",
         f"tcp dport {ports} ip6 saddr @{cfg['SET6']} accept",
-        f"tcp dport {ports} drop",
     ]
     if bool_config(cfg.get("MANAGE_UDP", "1")):
-        checks.extend([
+        lines.extend([
             f"udp dport {ports} ip saddr @{cfg['SET4']} accept",
             f"udp dport {ports} ip6 saddr @{cfg['SET6']} accept",
             f"udp dport {ports} drop",
         ])
-    return all(item in actual for item in checks)
+    lines.append(f"tcp dport {ports} drop")
+    return [normalized_rule(line) for line in lines]
+
+
+def listed_chain_lines(cfg):
+    proc = run(["nft", "list", "chain", "inet", cfg["TABLE"], cfg["CHAIN"]], check=False)
+    if proc.returncode != 0:
+        return None
+    lines = []
+    in_chain = False
+    for raw in proc.stdout.splitlines():
+        line = raw.strip()
+        if line == f"chain {cfg['CHAIN']} {{":
+            in_chain = True
+            continue
+        if not in_chain:
+            continue
+        if line == "}":
+            break
+        if line:
+            lines.append(normalized_rule(line))
+    return lines
+
+
+def set_has_timeout(cfg, set_name, expected_type):
+    proc = run(["nft", "list", "set", "inet", cfg["TABLE"], set_name], check=False)
+    if proc.returncode != 0:
+        return False
+    lines = {normalized_rule(line) for line in proc.stdout.splitlines()}
+    return f"type {expected_type}" in lines and "flags timeout" in lines
+
+
+def check_rules(cfg):
+    if not table_complete(cfg):
+        return False
+    if not set_has_timeout(cfg, cfg["SET4"], "ipv4_addr"):
+        return False
+    if not set_has_timeout(cfg, cfg["SET6"], "ipv6_addr"):
+        return False
+    return listed_chain_lines(cfg) == expected_chain_lines(cfg)
 
 
 def resolve_domains(domains, resolvers):
@@ -468,14 +532,22 @@ def resolve_domains(domains, resolvers):
 
 
 def load_state(path):
+    if not os.path.exists(path):
+        return {"4": {}, "6": {}}
     try:
         with open(path, "r", encoding="utf-8") as f:
             state = json.load(f)
-    except Exception:
-        state = {"4": {}, "6": {}}
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"state file is not valid JSON: {path}") from exc
+    except OSError as exc:
+        raise ValueError(f"cannot read state file: {path}") from exc
+    if not isinstance(state, dict):
+        raise ValueError(f"state file must contain an object: {path}")
     for fam in ("4", "6"):
-        if fam not in state or not isinstance(state[fam], dict):
+        if fam not in state:
             state[fam] = {}
+        elif not isinstance(state[fam], dict):
+            raise ValueError(f"state file has invalid {fam} family map: {path}")
     return state
 
 
@@ -717,7 +789,7 @@ EOF
 [Unit]
 Description=Install early nftables guard for x-ui panel ports
 DefaultDependencies=no
-After=local-fs.target
+After=local-fs.target nftables.service
 Before=network-pre.target ufw.service
 Wants=network-pre.target
 ConditionPathExists=$UPDATER
